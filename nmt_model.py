@@ -10,6 +10,8 @@ import torch.nn.utils
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 
+import numpy as np
+
 Hypothesis = namedtuple('Hypothesis', ['value', 'score'])
 
 
@@ -34,10 +36,15 @@ class NMT(nn.Module):
 
         """
         super(NMT, self).__init__()
+        self.attn_type = "additive"
         self.embed_size = embed_size
-        self.hidden_size = hidden_size
+        #self.hidden_size = hidden_size
+        self.hidden_size_en = hidden_size # now the input directly feeds to encoder hidden size
+        self.hidden_size_de = hidden_size * 2 # separately specify decoder hidden size
         self.dropout_rate = dropout_rate
         self.vocab = vocab
+        # print(self.hidden_size) # verified 64
+        # print(self.hidden_size_de) # verified 128
 
         # default values
         self.source_embeddings = None
@@ -50,6 +57,9 @@ class NMT(nn.Module):
         self.combined_output_projection = None
         self.target_vocab_projection = None
         self.dropout = None
+        self.attn_heads = 3
+        self.multihead_layer = nn.Linear(self.hidden_size_en * self.attn_heads, self.hidden_size_en, bias=False)
+        self.self_attention = False
 
         src_pad_token_idx = vocab.src['<pad>']
         self.source_embeddings = nn.Embedding(len(vocab.src), embed_size, padding_idx=src_pad_token_idx)
@@ -58,22 +68,37 @@ class NMT(nn.Module):
         self.target_embeddings = nn.Embedding(len(vocab.tgt), embed_size, padding_idx=tgt_pad_token_idx)
 
         # Bidirectional LSTM with bias
-        self.encoder = nn.LSTM(embed_size, hidden_size, bidirectional=True)
-        # LSTM Cell with bia
-        self.decoder = nn.LSTMCell(embed_size + hidden_size, hidden_size)
+        self.encoder = nn.LSTM(embed_size, self.hidden_size_en, bidirectional=True)
+        # LSTM Cell with bias
+        self.decoder = nn.LSTMCell(embed_size + self.hidden_size_en, self.hidden_size_de)
 
         # Linear Layer with no bias), called W_{h} in the PDF.
-        self.h_projection = nn.Linear(hidden_size * 2, hidden_size, bias=False)
+        self.h_projection = nn.Linear(self.hidden_size_en * 2, self.hidden_size_de, bias=False)
         # Linear Layer with no bias), called W_{c} in the PDF.
-        self.c_projection = nn.Linear(hidden_size * 2, hidden_size, bias=False)
+        self.c_projection = nn.Linear(self.hidden_size_en * 2, self.hidden_size_de, bias=False)
         # Linear Layer with no bias), called W_{attProj} in the PDF.
-        self.att_projection = nn.Linear(hidden_size * 2, hidden_size, bias=False)
+        self.att_projection = nn.Linear(self.hidden_size_en * 2, self.hidden_size_de, bias=False) # None
+        self.att_projection2 = nn.Linear(self.hidden_size_de, self.hidden_size_de, bias=False)
+
+        #self.att_projection_2 = nn.Linear(self.hidden_size_en * 2, self.hidden_size_de, bias=False)
+        #self.att_projection2_2 = nn.Linear(self.hidden_size_de, self.hidden_size_de, bias=False)
+
+
+        self.V = nn.Linear(self.hidden_size_de, 1 ,bias=False)
         # Linear Layer with no bias), called W_{u} in the PDF.
-        self.combined_output_projection = nn.Linear(hidden_size * 2 + hidden_size, hidden_size, bias=False)
+        self.combined_output_projection = nn.Linear(self.hidden_size_en * 2 + self.hidden_size_de, self.hidden_size_en, bias=False)
         # Linear Layer with no bias), called W_{vocab} in the PDF.
-        self.target_vocab_projection = nn.Linear(hidden_size, len(vocab.tgt), bias=False)
+        self.target_vocab_projection = nn.Linear(self.hidden_size_en, len(vocab.tgt), bias=False)
         # Dropout Layer
         self.dropout = nn.Dropout(self.dropout_rate)
+
+
+
+
+
+
+
+
 
     def forward(self, source: List[List[str]], target: List[List[str]]) -> torch.Tensor:
         """ Take a mini-batch of source and target sentences, compute the log-likelihood of
@@ -129,7 +154,6 @@ class NMT(nn.Module):
                                                 hidden state and cell.
         """
         enc_hiddens, dec_init_state = None, None
-
         # YOUR CODE HERE (~ 8 Lines)
         # TODO:
         #     1. Construct Tensor `X` of source sentences with shape (src_len, b, e) using the source model embeddings,
@@ -151,9 +175,91 @@ class NMT(nn.Module):
         #     Tensor Permute:
         #         https://pytorch.org/docs/stable/tensors.html#torch.Tensor.permute
 
+        _, batch_size = source_padded.shape
+        X = self.source_embeddings(source_padded)
+        enc_hiddens, (last_hidden, last_cell) = self.encoder(pack_padded_sequence(X, source_lengths))
+        enc_hiddens, _ = pad_packed_sequence(enc_hiddens)
+        enc_hiddens = enc_hiddens.permute(1,0,2)
+        last_hidden_init = torch.cat((last_hidden[0], last_hidden[1]), 1)
+        last_cell_init = torch.cat((last_cell[0], last_cell[1]),1)
+        dec_init_state = (self.h_projection(last_hidden_init), self.c_projection(last_cell_init))
+
+
         # END YOUR CODE
 
         return enc_hiddens, dec_init_state
+
+#    def decode(self, enc_hiddens: torch.Tensor, enc_masks: torch.Tensor,
+#               dec_init_state: Tuple[torch.Tensor, torch.Tensor],
+#               target_padded: torch.Tensor) -> torch.Tensor:
+#        """Compute combined output vectors for a batch.
+
+#        @param enc_hiddens (Tensor): Hidden states (b, src_len, h*2), where
+#                                     b = batch size, src_len = maximum source sentence length, h = hidden size.
+#        @param enc_masks (Tensor): Tensor of sentence masks (b, src_len), where
+#                                     b = batch size, src_len = maximum source sentence length.
+#        @param dec_init_state (tuple(Tensor, Tensor)): Initial state and cell for decoder
+#        @param target_padded (Tensor): Gold-standard padded target sentences (tgt_len, b), where
+#                                       tgt_len = maximum target sentence length, b = batch size.
+#
+#        @returns combined_outputs (Tensor): combined output tensor  (tgt_len, b,  h), where
+#                                        tgt_len = maximum target sentence length, b = batch_size,  h = hidden size
+#        """
+#        # Chop of the <END> token for max length sentences.
+#        target_padded = target_padded[:-1]
+#
+#        # Initialize the decoder state (hidden and cell)
+#        dec_state = dec_init_state
+#
+#        multihead_outputs = []
+#
+#        for x in range(self.attn_heads):
+#
+#            # Initialize previous combined output vector o_{t-1} as zero
+#            batch_size = enc_hiddens.size(0)
+#            o_prev = torch.zeros(batch_size, self.hidden_size_en, device=self.device)
+#
+#            # Initialize a list we will use to collect the combined output o_t on each step
+#            combined_outputs = []
+#
+#            if self.att_projection:
+#                enc_hiddens_proj = self.att_projection(enc_hiddens)
+#
+#            else:
+#                enc_hiddens_proj = None
+#
+#
+#            Y = self.target_embeddings(target_padded)
+#
+#            Y_ts = Y.split(1, dim = 0)
+#
+#            # iterate over time dimensions of Y
+#            for Y_t in Y_ts:
+#                Y_bar = torch.cat((Y_t.squeeze(0), o_prev), dim=1)
+#
+#                # use step function to calculate decoder states and combined output o_t
+#                dec_state, o_t, e_t = self.step(Y_bar, dec_state, enc_hiddens, enc_hiddens_proj, enc_masks)
+#
+#                # append o_t to combined_outputs
+#                combined_outputs.append(o_t)
+#
+#                # update o_prev to the new o_t
+#                o_prev = o_t
+#                #print(o_t.shape)
+#
+#            combined_outputs = torch.stack(combined_outputs)
+#            multihead_outputs.append(combined_outputs)
+#            #print(combined_outputs.shape)
+#
+#
+#        #print(combined_outputs.shape)
+#        multihead_outputs = torch.cat(multihead_outputs, axis=2)
+#        #multihead_outputs = torch.stack(multihead_outputs).permute(1,2,3,0)
+#        #print(multihead_outputs.shape)
+#        multihead_output = self.multihead_layer(multihead_outputs)
+#        #print(multihead_outputs.shape)
+#        #print(combined_outputs.shape)
+#        return multihead_output
 
     def decode(self, enc_hiddens: torch.Tensor, enc_masks: torch.Tensor,
                dec_init_state: Tuple[torch.Tensor, torch.Tensor],
@@ -179,7 +285,7 @@ class NMT(nn.Module):
 
         # Initialize previous combined output vector o_{t-1} as zero
         batch_size = enc_hiddens.size(0)
-        o_prev = torch.zeros(batch_size, self.hidden_size, device=self.device)
+        o_prev = torch.zeros(batch_size, self.hidden_size_en, device=self.device)
 
         # Initialize a list we will use to collect the combined output o_t on each step
         combined_outputs = []
@@ -213,8 +319,49 @@ class NMT(nn.Module):
         #     Tensor Stacking:
         #         https://pytorch.org/docs/stable/torch.html#torch.stack
 
+        if self.attn_type == "dot" or self.attn_type == "scaled_dot":
+            enc_hiddens_proj = None
+        else:
+            enc_hiddens_proj = self.att_projection(enc_hiddens)
+
+        Y = self.target_embeddings(target_padded)
+        Y_ts = Y.split(1, dim = 0)
+        #print(len(Y_ts))
+        #t = 0
+        # iterate over time dimensions of Y
+        for Y_t in Y_ts:
+
+            Y_bar = torch.cat((Y_t.squeeze(0), o_prev), dim=1)
+
+            # use step function to calculate decoder states and combined output o_t
+            dec_state, o_t, e_t = self.step(Y_bar, dec_state, enc_hiddens, enc_hiddens_proj, enc_masks)
+
+            # append o_t to combined_outputs
+            combined_outputs.append(o_t)
+
+            # update o_prev to the new o_t
+            o_prev = o_t
+
+
+
+            #### THESE BELONGS TO STEP FUNCTION!!
+            # calculate decoder states
+            #dec_state = self.decoder(Y_bar, dec_state)
+            #h_prev, c_prev = dec_state
+
+            # calculate attention
+            #e_t = h_prev.t().matmul(h_enc_proj.squeeze())
+            #alpha_t = F.softmax(e_t)
+            #print(e_t.shape)
+            #print(alpha_t.shape)
+            #print(h_enc_proj.squeeze().shape)
         # END YOUR CODE
+            #t += 1
+
+        combined_outputs = torch.stack(combined_outputs)
+
         return combined_outputs
+
 
     def step(self, Ybar_t: torch.Tensor,
              dec_state: Tuple[torch.Tensor, torch.Tensor],
@@ -273,6 +420,31 @@ class NMT(nn.Module):
         #     Tensor Squeeze:
         #         https://pytorch.org/docs/stable/torch.html#torch.squeeze
 
+        # calculate the decoder states
+        dec_state = self.decoder(Ybar_t, dec_state)
+        dec_hidden, dec_cell = dec_state
+
+        # compute attention scores
+        e_t_dot = torch.bmm(dec_hidden.unsqueeze(1), enc_hiddens.permute(0,2,1)).squeeze(1)
+        e_t_scaled_dot = (torch.bmm(dec_hidden.unsqueeze(1), enc_hiddens.permute(0,2,1)).squeeze(1))/np.sqrt(enc_hiddens.shape[1])
+        if self.attn_type != "dot" and self.attn_type != "scaled_dot":
+            e_t_mult = torch.bmm(dec_hidden.unsqueeze(1), enc_hiddens_proj.permute(0,2,1)).squeeze(1)
+            # additive attention score
+            dec_hiddens_proj = self.att_projection2(dec_hidden).unsqueeze(1)
+            e_t_add = self.V(F.tanh((enc_hiddens_proj + dec_hiddens_proj))).squeeze(2)
+
+
+        if self.attn_type == "dot":
+            e_t = e_t_dot
+        elif self.attn_type == "scaled_dot":
+            e_t = e_t_scaled_dot
+        elif self.attn_type == "averaged":
+            e_t = (e_t_mult + e_t_add + e_t_scaled_dot)/3
+        elif self.attn_type == "multiplicative":
+            e_t = e_t_mult
+        elif self.attn_type == "additive":
+            e_t = e_t_add
+
         # END YOUR CODE
 
         # Set e_t to -inf where enc_masks has 1
@@ -307,6 +479,24 @@ class NMT(nn.Module):
         #         https://pytorch.org/docs/stable/torch.html#torch.tanh
 
         # END YOUR CODE
+
+        # calculate alpha_t
+        #print(e_t.shape)
+        alpha_t = F.softmax(e_t, dim=1)
+        #print(alpha_t)
+        #print(F.softmax(e_t, dim=1))
+        #print(alpha_t.unsqueeze(1).shape)
+        a_t = torch.bmm(alpha_t.unsqueeze(1),enc_hiddens).squeeze(1)
+        #print(a_t.shape)
+
+        #print(dec_hidden.shape)
+        U_t = torch.cat((a_t, dec_hidden),dim=1)
+        #print(U_t.shape)
+
+        V_t = self.combined_output_projection(U_t)
+        #print(V_t.shape)
+        O_t = torch.tanh(V_t)
+        O_t = self.dropout(O_t)
 
         combined_output = O_t
         return dec_state, combined_output, e_t
@@ -345,7 +535,7 @@ class NMT(nn.Module):
             src_encodings_att_linear = self.att_projection(src_encodings)
 
         h_tm1 = dec_init_vec
-        att_tm1 = torch.zeros(1, self.hidden_size, device=self.device)
+        att_tm1 = torch.zeros(1, self.hidden_size_en, device=self.device)
 
         hypotheses = [['<s>']]
         hyp_scores = torch.zeros(len(hypotheses), dtype=torch.float, device=self.device)
@@ -444,13 +634,13 @@ class NMT(nn.Module):
         return model
 
     def save(self, path: str):
-        """ Save the odel to a file.
+        """ Save the model to a file.
         @param path (str): path to the model
         """
 
         params = {
             'args': dict(embed_size=self.embed_size,
-                         hidden_size=self.hidden_size,
+                         hidden_size=self.hidden_size_en,
                          dropout_rate=self.dropout_rate),
             'vocab': self.vocab,
             'state_dict': self.state_dict()
